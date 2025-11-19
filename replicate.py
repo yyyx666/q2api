@@ -192,7 +192,14 @@ def inject_model(body_json: Dict[str, Any], model: Optional[str]) -> None:
     except Exception:
         pass
 
-async def send_chat_request(access_token: str, messages: List[Dict[str, Any]], model: Optional[str] = None, stream: bool = False, timeout: Tuple[int,int] = (15,300)) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], StreamTracker]:
+async def send_chat_request(
+    access_token: str,
+    messages: List[Dict[str, Any]],
+    model: Optional[str] = None,
+    stream: bool = False,
+    timeout: Tuple[int,int] = (15,300),
+    client: Optional[httpx.AsyncClient] = None
+) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], StreamTracker]:
     url, headers_from_log, body_json = load_template()
     headers_from_log["amz-sdk-invocation-id"] = str(uuid.uuid4())
     try:
@@ -205,31 +212,42 @@ async def send_chat_request(access_token: str, messages: List[Dict[str, Any]], m
     payload_str = json.dumps(body_json, ensure_ascii=False)
     headers = _merge_headers(headers_from_log, access_token)
     
-    # Build mounts with proxy if available
-    proxies = _get_proxies()
-    mounts = None
-    if proxies:
-        proxy_url = proxies.get("https") or proxies.get("http")
-        if proxy_url:
-            mounts = {
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
+    local_client = False
+    if client is None:
+        local_client = True
+        proxies = _get_proxies()
+        mounts = None
+        if proxies:
+            proxy_url = proxies.get("https") or proxies.get("http")
+            if proxy_url:
+                mounts = {
+                    "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                    "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                }
+        client = httpx.AsyncClient(mounts=mounts, timeout=httpx.Timeout(timeout[0], read=timeout[1]))
     
-    async with httpx.AsyncClient(mounts=mounts, timeout=httpx.Timeout(timeout[0], read=timeout[1])) as client:
-        async with client.stream("POST", url, headers=headers, content=payload_str) as resp:
-            if resp.status_code >= 400:
-                try:
-                    err = await resp.aread()
-                    err = err.decode("utf-8", errors="ignore")
-                except Exception:
-                    err = f"HTTP {resp.status_code}"
-                raise httpx.HTTPError(f"Upstream error {resp.status_code}: {err}")
-            
-            parser = AwsEventStreamParser()
-            tracker = StreamTracker()
-            
-            async def _iter_text() -> AsyncGenerator[str, None]:
+    # Use manual request sending to control stream lifetime
+    req = client.build_request("POST", url, headers=headers, content=payload_str)
+    
+    try:
+        resp = await client.send(req, stream=True)
+        
+        if resp.status_code >= 400:
+            try:
+                await resp.read()
+                err = resp.text
+            except Exception:
+                err = f"HTTP {resp.status_code}"
+            await resp.aclose()
+            if local_client:
+                await client.aclose()
+            raise httpx.HTTPError(f"Upstream error {resp.status_code}: {err}")
+        
+        parser = AwsEventStreamParser()
+        tracker = StreamTracker()
+        
+        async def _iter_text() -> AsyncGenerator[str, None]:
+            try:
                 async for chunk in resp.aiter_bytes():
                     if not chunk:
                         continue
@@ -247,11 +265,29 @@ async def send_chat_request(access_token: str, messages: List[Dict[str, Any]], m
                                     yield txt
                             except Exception:
                                 pass
-            
-            if stream:
-                return None, tracker.track(_iter_text()), tracker
-            else:
-                buf = []
+            except Exception:
+                # If we have already yielded content, suppress the error to allow partial success.
+                # If no content has been yielded yet (tracker.has_content is False), re-raise.
+                if not tracker.has_content:
+                    raise
+            finally:
+                await resp.aclose()
+                if local_client:
+                    await client.aclose()
+        
+        if stream:
+            return None, tracker.track(_iter_text()), tracker
+        else:
+            buf = []
+            try:
                 async for t in tracker.track(_iter_text()):
                     buf.append(t)
-                return "".join(buf), None, tracker
+            finally:
+                # Ensure cleanup if not streamed
+                pass
+            return "".join(buf), None, tracker
+
+    except Exception:
+        if local_client and client:
+            await client.aclose()
+        raise
