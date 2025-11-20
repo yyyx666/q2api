@@ -1213,42 +1213,42 @@ async def health():
 # Startup / Shutdown Events
 # ------------------------------------------------------------------------------
 
-async def _verify_disabled_accounts_loop():
-    """后台验证禁用账号任务"""
-    while True:
-        try:
-            await asyncio.sleep(1800)
-            async with _conn() as conn:
-                accounts = await _list_disabled_accounts(conn)
-                if accounts:
-                    for account in accounts:
-                        other = account.get('other')
-                        if other:
-                            try:
-                                other_dict = json.loads(other) if isinstance(other, str) else other
-                                if other_dict.get('failedReason') == 'AccessDenied':
-                                    continue
-                            except:
-                                pass
-                        try:
-                            verify_success, fail_reason = await verify_account(account)
-                            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-                            if verify_success:
-                                await conn.execute("UPDATE accounts SET enabled=1, updated_at=? WHERE id=?", (now, account['id']))
-                            elif fail_reason:
-                                other_dict = {}
-                                if account.get('other'):
-                                    try:
-                                        other_dict = json.loads(account['other']) if isinstance(account['other'], str) else account['other']
-                                    except:
-                                        pass
-                                other_dict['failedReason'] = fail_reason
-                                await conn.execute("UPDATE accounts SET other=?, updated_at=? WHERE id=?", (json.dumps(other_dict, ensure_ascii=False), now, account['id']))
-                            await conn.commit()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+# async def _verify_disabled_accounts_loop():
+#     """后台验证禁用账号任务"""
+#     while True:
+#         try:
+#             await asyncio.sleep(1800)
+#             async with _conn() as conn:
+#                 accounts = await _list_disabled_accounts(conn)
+#                 if accounts:
+#                     for account in accounts:
+#                         other = account.get('other')
+#                         if other:
+#                             try:
+#                                 other_dict = json.loads(other) if isinstance(other, str) else other
+#                                 if other_dict.get('failedReason') == 'AccessDenied':
+#                                     continue
+#                             except:
+#                                 pass
+#                         try:
+#                             verify_success, fail_reason = await verify_account(account)
+#                             now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+#                             if verify_success:
+#                                 await conn.execute("UPDATE accounts SET enabled=1, updated_at=? WHERE id=?", (now, account['id']))
+#                             elif fail_reason:
+#                                 other_dict = {}
+#                                 if account.get('other'):
+#                                     try:
+#                                         other_dict = json.loads(account['other']) if isinstance(account['other'], str) else account['other']
+#                                     except:
+#                                         pass
+#                                 other_dict['failedReason'] = fail_reason
+#                                 await conn.execute("UPDATE accounts SET other=?, updated_at=? WHERE id=?", (json.dumps(other_dict, ensure_ascii=False), now, account['id']))
+#                             await conn.commit()
+#                         except Exception:
+#                             pass
+#         except Exception:
+#             pass
 
 @app.on_event("startup")
 async def startup_event():
@@ -1256,7 +1256,7 @@ async def startup_event():
     await _init_global_client()
     await _ensure_db()
     asyncio.create_task(_refresh_stale_tokens())
-    asyncio.create_task(_verify_disabled_accounts_loop())
+    # asyncio.create_task(_verify_disabled_accounts_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():

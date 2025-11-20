@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  account-feeder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: q2api-account-feeder
+    ports:
+      - "${FEEDER_PORT:-8001}:${FEEDER_PORT:-8001}"
+    environment:
+      - FEEDER_PORT=${FEEDER_PORT:-8001}
+      - API_SERVER=${API_SERVER:-http://q2api:8000}
+      - HTTP_PROXY=${HTTP_PROXY}
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${FEEDER_PORT:-8001}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - q2api-network
+
+networks:
+  q2api-network:
+    external: true
+    name: v2_default
