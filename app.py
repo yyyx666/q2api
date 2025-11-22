@@ -6,6 +6,8 @@ import time
 import asyncio
 import importlib.util
 import random
+import secrets
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
 
@@ -255,6 +257,13 @@ def _is_console_enabled() -> bool:
 
 CONSOLE_ENABLED: bool = _is_console_enabled()
 
+# Admin authentication configuration
+ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin")
+SESSION_EXPIRE_DAYS: int = 30
+
+# Admin session storage: {token: expiration_datetime}
+ADMIN_SESSIONS: Dict[str, datetime] = {}
+
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
         return None
@@ -462,9 +471,37 @@ async def _update_stats(account_id: str, success: bool) -> None:
 # Dependencies
 # ------------------------------------------------------------------------------
 
-async def require_account(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
-    bearer = _extract_bearer(authorization)
-    return await resolve_account_for_key(bearer)
+async def require_account(
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None)
+) -> Dict[str, Any]:
+    key = _extract_bearer(authorization) if authorization else x_api_key
+    return await resolve_account_for_key(key)
+
+def verify_admin_session(authorization: Optional[str] = Header(None)) -> bool:
+    """Verify admin session token for console access"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Unauthorized access", "code": "UNAUTHORIZED"}
+        )
+
+    token = authorization[7:]  # Remove "Bearer " prefix
+
+    if token not in ADMIN_SESSIONS:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Invalid session", "code": "SESSION_INVALID"}
+        )
+
+    if datetime.now() > ADMIN_SESSIONS[token]:
+        del ADMIN_SESSIONS[token]
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Session expired", "code": "SESSION_EXPIRED"}
+        )
+
+    return True
 
 # ------------------------------------------------------------------------------
 # OpenAI-compatible Chat endpoint
@@ -882,6 +919,14 @@ class AuthStartBody(BaseModel):
     label: Optional[str] = None
     enabled: Optional[bool] = True
 
+class AdminLoginRequest(BaseModel):
+    password: str
+
+class AdminLoginResponse(BaseModel):
+    success: bool
+    token: Optional[str] = None
+    message: str
+
 async def _create_account_from_tokens(
     client_id: str,
     client_secret: str,
@@ -917,8 +962,45 @@ async def _create_account_from_tokens(
 
 # 管理控制台相关端点 - 仅在启用时注册
 if CONSOLE_ENABLED:
+    # ------------------------------------------------------------------------------
+    # Admin Authentication Endpoints
+    # ------------------------------------------------------------------------------
+
+    @app.post("/api/login", response_model=AdminLoginResponse)
+    async def admin_login(request: AdminLoginRequest) -> AdminLoginResponse:
+        """Admin login endpoint - password only"""
+        if request.password != ADMIN_PASSWORD:
+            return AdminLoginResponse(
+                success=False,
+                message="Invalid password"
+            )
+
+        # Generate session token
+        session_token = secrets.token_urlsafe(32)
+
+        # Store session with expiration
+        ADMIN_SESSIONS[session_token] = datetime.now() + timedelta(days=SESSION_EXPIRE_DAYS)
+
+        return AdminLoginResponse(
+            success=True,
+            token=session_token,
+            message="Login successful"
+        )
+
+    @app.get("/login", response_class=FileResponse)
+    def login_page():
+        """Serve the login page"""
+        path = BASE_DIR / "frontend" / "login.html"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="frontend/login.html not found")
+        return FileResponse(str(path))
+
+    # ------------------------------------------------------------------------------
+    # Device Authorization Endpoints
+    # ------------------------------------------------------------------------------
+
     @app.post("/v2/auth/start")
-    async def auth_start(body: AuthStartBody):
+    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_session)):
         """
         Start device authorization and return verification URL for user login.
         Session lifetime capped at 5 minutes on claim.
@@ -955,7 +1037,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/auth/status/{auth_id}")
-    async def auth_status(auth_id: str):
+    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_session)):
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
@@ -970,7 +1052,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.post("/v2/auth/claim/{auth_id}")
-    async def auth_claim(auth_id: str):
+    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_session)):
         """
         Block up to 5 minutes to exchange the device code for tokens after user completed login.
         On success, creates an enabled account and returns it.
@@ -1025,7 +1107,7 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/accounts")
-    async def create_account(body: AccountCreate):
+    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_session)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         acc_id = str(uuid.uuid4())
         other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
@@ -1074,7 +1156,7 @@ if CONSOLE_ENABLED:
                 traceback.print_exc()
 
     @app.post("/v2/accounts/feed")
-    async def create_accounts_feed(request: BatchAccountCreate):
+    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_session)):
         """
         统一的投喂接口，接收账号列表，立即存入并后台异步验证。
         """
@@ -1120,23 +1202,23 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/accounts")
-    async def list_accounts():
+    async def list_accounts(_: bool = Depends(verify_admin_session)):
         rows = await _db.fetchall("SELECT * FROM accounts ORDER BY created_at DESC")
         return [_row_to_dict(r) for r in rows]
 
     @app.get("/v2/accounts/{account_id}")
-    async def get_account_detail(account_id: str):
+    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_session)):
         return await get_account(account_id)
 
     @app.delete("/v2/accounts/{account_id}")
-    async def delete_account(account_id: str):
+    async def delete_account(account_id: str, _: bool = Depends(verify_admin_session)):
         rowcount = await _db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
         if rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"deleted": account_id}
 
     @app.patch("/v2/accounts/{account_id}")
-    async def update_account(account_id: str, body: AccountUpdate):
+    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_session)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         fields = []
         values: List[Any] = []
@@ -1169,7 +1251,7 @@ if CONSOLE_ENABLED:
         return _row_to_dict(row)
 
     @app.post("/v2/accounts/{account_id}/refresh")
-    async def manual_refresh(account_id: str):
+    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_session)):
         return await refresh_access_token_in_db(account_id)
 
     # ------------------------------------------------------------------------------
@@ -1177,6 +1259,9 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     # Frontend inline HTML removed; serving ./frontend/index.html instead (see route below)
+    # Note: This route is NOT protected - the HTML file is served freely,
+    # but the frontend JavaScript checks authentication and redirects to /login if needed.
+    # All API endpoints remain protected.
 
     @app.get("/", response_class=FileResponse)
     def index():

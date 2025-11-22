@@ -115,6 +115,10 @@ HTTP_PROXY=""
 # 设置为 "false" 或 "0" 可禁用管理控制台和相关API端点
 ENABLE_CONSOLE="true"
 
+# 管理控制台登录密码（默认 "admin"）
+# 用于访问管理控制台的密码，会话有效期为30天
+ADMIN_PASSWORD="admin"
+
 # 主服务端口（默认 8000）
 PORT=8000
 ```
@@ -125,6 +129,7 @@ PORT=8000
 - API Key 仅用于访问控制，不映射到特定账号
 - 账号选择策略：从所有启用账号中随机选择
 - `ENABLE_CONSOLE` 设为 `false` 或 `0`：禁用 Web 管理控制台和账号管理 API
+- `ADMIN_PASSWORD`：管理控制台登录密码，默认为 "admin"，建议修改为强密码
 
 #### 3. 启动服务
 
@@ -137,11 +142,25 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 
 ## 📖 使用指南
 
+### 管理控制台登录
+
+首次访问管理控制台需要登录：
+
+1. 访问 http://localhost:8000/ 将自动跳转到登录页面
+2. 输入管理员密码（默认为 `admin`，可通过 `ADMIN_PASSWORD` 环境变量配置）
+3. 登录成功后，会话有效期为 **30 天**
+4. 会话过期后需要重新登录
+
+**安全建议：**
+- 生产环境务必修改 `ADMIN_PASSWORD` 为强密码
+- 登录凭证存储在浏览器 localStorage 中
+- 所有管理 API 请求需要在 Authorization 头中携带会话 token
+
 ### 账号管理
 
 #### 方式一：Web 控制台（推荐）
 
-访问 http://localhost:8000/ 使用可视化界面：
+登录管理控制台后，使用可视化界面：
 - 查看所有账号及详细状态
 - URL 登录（设备授权）快速添加账号
 - 创建/删除/编辑账号
@@ -171,10 +190,22 @@ curl -X POST http://localhost:8000/v2/auth/claim/{authId}
 
 #### 方式三：REST API 手动管理
 
+**注意：** 所有管理 API 请求需要携带登录凭证（Authorization Bearer Token）
+
+**先登录获取 Token**
+```bash
+# 登录并获取 token
+TOKEN=$(curl -X POST http://localhost:8000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"password": "admin"}' \
+  | jq -r '.token')
+```
+
 **创建账号**
 ```bash
 curl -X POST http://localhost:8000/v2/accounts \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{
     "label": "手动创建的账号",
     "clientId": "your-client-id",
@@ -186,24 +217,28 @@ curl -X POST http://localhost:8000/v2/accounts \
 
 **列出所有账号**
 ```bash
-curl http://localhost:8000/v2/accounts
+curl http://localhost:8000/v2/accounts \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 **更新账号**
 ```bash
 curl -X PATCH http://localhost:8000/v2/accounts/{account_id} \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"enabled": false}'
 ```
 
 **刷新 Token**
 ```bash
-curl -X POST http://localhost:8000/v2/accounts/{account_id}/refresh
+curl -X POST http://localhost:8000/v2/accounts/{account_id}/refresh \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 **删除账号**
 ```bash
-curl -X DELETE http://localhost:8000/v2/accounts/{account_id}
+curl -X DELETE http://localhost:8000/v2/accounts/{account_id} \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ### OpenAI 兼容 API
@@ -387,6 +422,7 @@ v2/
 | `MAX_ERROR_COUNT` | 错误次数阈值 | 100 | `50` |
 | `HTTP_PROXY` | HTTP代理地址 | 空 | `"http://127.0.0.1:7890"` |
 | `ENABLE_CONSOLE` | 管理控制台开关 | `"true"` | `"false"` |
+| `ADMIN_PASSWORD` | 管理控制台登录密码 | `"admin"` | `"your-secure-password"` |
 | `PORT` | 服务端口 | 8000 | `8080` |
 
 ### 数据库结构
@@ -412,16 +448,20 @@ CREATE TABLE accounts (
 
 ## 📝 完整 API 端点列表
 
-### 账号管理（需启用 ENABLE_CONSOLE）
+### 管理员认证（需启用 ENABLE_CONSOLE）
+- `POST /api/login` - 管理员登录，获取会话 token
+- `GET /login` - 登录页面
+
+### 账号管理（需启用 ENABLE_CONSOLE，需登录）
 - `POST /v2/accounts` - 创建账号
-- `POST /v2/accounts/batch` - 批量创建账号
+- `POST /v2/accounts/feed` - 批量创建账号
 - `GET /v2/accounts` - 列出所有账号
 - `GET /v2/accounts/{id}` - 获取账号详情
 - `PATCH /v2/accounts/{id}` - 更新账号
 - `DELETE /v2/accounts/{id}` - 删除账号
 - `POST /v2/accounts/{id}/refresh` - 刷新 Token
 
-### 设备授权（需启用 ENABLE_CONSOLE）
+### 设备授权（需启用 ENABLE_CONSOLE，需登录）
 - `POST /v2/auth/start` - 启动登录流程
 - `GET /v2/auth/status/{authId}` - 查询登录状态
 - `POST /v2/auth/claim/{authId}` - 等待并创建账号（最多5分钟）
@@ -434,7 +474,7 @@ CREATE TABLE accounts (
 - `POST /v1/messages/count_tokens` - Token 计数接口（预先统计消息的 token 数量）
 
 ### 其他
-- `GET /` - Web 控制台（需启用 ENABLE_CONSOLE）
+- `GET /` - Web 控制台首页（需启用 ENABLE_CONSOLE，需登录）
 - `GET /healthz` - 健康检查
 - `GET /docs` - API 文档（Swagger UI）
 
@@ -489,11 +529,13 @@ server {
 
 ## 🔒 安全建议
 
-1. **生产环境必须配置 `OPENAI_KEYS`**
-2. **使用 HTTPS 反向代理（Nginx + Let's Encrypt）**
-3. **定期备份数据库**（SQLite: `data.sqlite3`，或 PG/MySQL 数据库）
-4. **限制数据库访问权限**
-5. **配置防火墙规则，限制访问来源**
+1. **生产环境必须修改 `ADMIN_PASSWORD` 为强密码**
+2. **生产环境必须配置 `OPENAI_KEYS`**
+3. **使用 HTTPS 反向代理（Nginx + Let's Encrypt）**
+4. **定期备份数据库**（SQLite: `data.sqlite3`，或 PG/MySQL 数据库）
+5. **限制数据库访问权限**
+6. **配置防火墙规则，限制访问来源**
+7. **管理控制台会话有效期为 30 天，建议定期重新登录**
 
 ## 📄 许可证
 
